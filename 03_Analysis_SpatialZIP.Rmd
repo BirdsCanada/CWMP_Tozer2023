@@ -1,0 +1,710 @@
+---
+title: "03-Analysis"
+author: "Danielle Ethier"
+date: "2022-07-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#Load libraries
+
+```{r library}
+
+library(tidyverse)
+#install.packages("INLA", repos=c(getOption("repos"), 
+#        INLA="https://inla.r-inla-download.org/R/testing"), dep=TRUE)
+library(INLA)
+library(inlabru)
+library(spdep)
+library(rgdal)
+library(VGAM)
+
+#remotes::install_github("inbo/inlatools")
+library(inlatools)
+
+```
+
+#Load multiplot function
+
+This is used to inspect residuals. 
+
+```{r multi}
+######################################################
+MyMultipanel.ggp2 <- function(Z, varx, vary, 
+                              ylab = "Response variable",
+                              addSmoother = FALSE,
+                              addRegressionLine = FALSE,
+                              addHorizontalLine = FALSE) {
+  K <- length(varx)
+  MyData <- data.frame(Y = rep(as.vector(as.matrix(Z[,vary])), K),
+                       X = as.vector(as.matrix(Z[, varx])),
+                       Var = rep(varx, each = nrow(Z))) 
+  library(ggplot2)
+  p <- ggplot(MyData, aes(y = Y, x = X))
+  p <- p + geom_point() + ylab(ylab) + xlab("Covariates")
+  p <- p + theme(text = element_text(size=15))
+  if (addSmoother == TRUE) {
+  	 p <- p + geom_smooth(se = TRUE, col = "black", lwd = 1)
+  }
+  if (addRegressionLine == TRUE) {
+  	 p <- p + geom_smooth(se = TRUE, col = "black", lwd = 1, method = "lm")
+  }
+  if (addRegressionLine == TRUE) {
+  	 p <- p + geom_smooth(se = TRUE, col = "black", lwd = 1, method = "lm")
+  }
+  if (addHorizontalLine == TRUE) {
+  	 p <- p + geom_hline(yintercept = 0)
+  }
+  p <- p + facet_wrap(~ Var, scales = "free_x")
+  suppressMessages(print(p)) 	
+}
+######################################################
+```
+
+#Load data and set directories
+
+Note: this is a zero-filled and range reduced data table
+
+```{r data}
+
+dat<-read.csv("Output/CWMP_MaxCount.csv")
+dat<-dat %>% drop_na() %>% select(site_id, year, class, basin, pcntag, pcntdev, PerWetland, lakelevel, taxa_code, maxcount)
+
+#events<-read.csv("Output/Events.csv")
+#family<-read.csv("Output/DistTable.csv")
+
+out.dir<-"Output/"
+
+```
+
+#Make spatial grid 
+
+```{r spatial grid}
+
+Grid <- readOGR(dsn="C:/Users/dethier/Documents/ethier-scripts/CWMP/Data", layer="greatlakes_subbasins")
+grid_key <- unique(dat[, c("basin")])
+row.names(grid_key) <- NULL
+
+nb1 <- poly2nb(Grid, row.names=Grid$data); nb1
+
+is.symmetric.nb(nb1, verbose = FALSE, force = TRUE)
+nb2INLA("nb1.graph", nb1)
+nb1.adj <- paste(getwd(),"/nb1.graph", sep="")
+g1 <- inla.read.graph("nb1.graph")
+
+```
+
+#Analysis 
+
+ZIP = zeroinflatedpoisson1
+spatial dependency = basin + year
+covariates (fixed) = pcntag + pcntdev + lakelevel + PerWetland
+covariates (random) = class
+
+```{r ZIP}
+
+##-----------------------------------------------------------
+##Create output tables before entering the loop
+
+#Annual index of abundance output table
+d3<- as.data.frame(matrix(data = NA, nrow = 1, ncol = 6, byrow = FALSE, dimnames = NULL))
+names(d3) <- c("basin", "year", "taxa_code", "abund", "abund_lci", "abund_cui")
+write.table(d3, file = paste(out.dir, "AnnualIndex.csv"), row.names = FALSE, append = FALSE, quote = FALSE, sep = ",")
+
+#Tau Total
+tau_prov<- as.data.frame(matrix(data = NA, nrow = 1, ncol = 7, byrow = FALSE, dimnames = NULL))
+names(tau_prov) <- c("StateProvince","med_tau", "lcl_tau", "ucl_tau", "iw_tau", "n", "taxa_code")
+write.table(tau_prov, file = paste(out.dir, "Tau_All.csv"), row.names = FALSE, append = FALSE, quote = FALSE, sep = ",")
+
+#Alaph Total
+alpha_prov<- as.data.frame(matrix(data = NA, nrow = 1, ncol = 7, byrow = FALSE, dimnames = NULL))
+names(alpha_prov) <- c("StateProvince","med_alpha", "lcl_alpha", "ucl_alpha", "iw_alpha", "n", "taxa_code")
+write.table(alpha_prov, file = paste(out.dir, "Alpha_All.csv"), row.names = FALSE, append = FALSE, quote = FALSE, sep = ",")
+
+#Posterior Summary
+post_sum<- as.data.frame(matrix(data = NA, nrow = 1, ncol = 12, byrow = FALSE, dimnames = NULL))
+names(post_sum) <- c("alpha_i", "alph", "alph_ll", "alph_ul", "alph_iw", "tau", "tau_ll", "tau_ul", "tau_iw", "tau_sig", "basin", "taxa_code")
+write.table(post_sum, file = paste(out.dir, "PosteriorSummary.csv"), row.names = FALSE, append = FALSE, quote = FALSE, sep = ",")
+
+
+##-----------------------------------------------------------
+#Prepare the data
+
+sp.list<-unique(dat$taxa_code)
+max.yr<-max(dat$year)
+
+#standardize year to 2021, prepare index varaibles 
+#where i = grid cell (basin), k = site, t = year
+dat <- dat %>% mutate(std_yr = year - max.yr)
+dat$class<-as.factor(dat$class)
+dat$basin<-as.factor(dat$basin)
+dat$kappa_k <- as.integer(factor(dat$site_id)) #index for the random site effect
+dat$tau_i <- dat$alpha_i <- as.integer(factor(dat$basin)) #index for each basin intercept and slope
+
+#Specify model with year-basin effects so that we can predict the annual index value for each basin
+dat$gamma_ij <- paste0(dat$alpha_i, "-", dat$year)
+dat$yearfac = as.factor(dat$year)
+
+#sp.list<-sp.list[1:17] #remove COGR, COYE, RWBL
+
+#modified species list
+#sp.list<-sp.list[c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 18, 19, 20)]
+
+#species analysis loop
+for(m in 1:length(sp.list)) {
+
+ #m<-12 #for testing each species
+
+  sp.data <-NULL 
+  sp.data <- filter(dat, taxa_code == sp.list[m]) %>%
+      droplevels()
+  sp<-sp.list[m] 
+  
+print(paste("Currently analyzing species ", m, "/", sp.list[m], sep = "")) 
+
+grid_key<-NULL
+grid_key <- unique(sp.data[, c("basin", "alpha_i")])
+grid_key$StateProvince<-"All"
+row.names(grid_key) <- NULL
+
+###################################################
+#Model 2 
+
+#Formula 
+
+f2 <- maxcount ~ -1 + pcntag + pcntdev + lakelevel + PerWetland +
+  # cell ICAR random intercepts
+  f(alpha_i, model="besag", graph=g1, constr=FALSE, scale.model=TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)))) +
+  # cell ICAR random year slopes
+  f(tau_i, std_yr, model="besag", graph=g1, constr=FALSE, scale.model=TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)))) +
+  # random site intercepts
+  f(kappa_k, model="iid", constr=TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01))))+
+ # basin-year effect
+  f(gamma_ij, model="iid", constr=TRUE, 
+   hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)))) +
+ # residual temporal autocorrelation
+#   f(yearfac, model = "ar1", hyper = list(prec = list(param =  c(10, 100)))) 
+f(class, model="iid", constr=TRUE, 
+   hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01))))
+
+##-----------------------------------------------------------
+#Assign family
+fam<-ifelse(sp=="COGR"| sp=="RWBL", "nbinomial", ifelse(sp=="COYE", "poisson", "zeroinflatedpoisson1"))
+
+
+out2<- inla(f2, family=fam, data=sp.data,
+            control.compute=list(cpo=T, dic=TRUE, waic=TRUE, return.marginals.predictor=TRUE, config=TRUE),
+            control.inla=list(strategy="adaptive",
+                              int.strategy="auto"),
+           control.predictor = list(compute=TRUE),
+            num.threads=3,
+            verbose=T)
+
+##-----------------------------------------------------------
+#Get results
+
+#Fixed
+fixed.out<-out2$summary.fixed[,c("mean", "sd", "0.025quant", "0.975quant")]
+fixed.out<-signif(fixed.out, digits = 4)
+fixed.out$Species <- sp.list[m]
+names(fixed.out)[1:5] <- c("mean", "SD", "0.025quant", "0.975quant", "Speices")
+  
+write.table(fixed.out, paste(out.dir, "Fixed_Summary.csv"), row.names = TRUE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+#Random spatial
+random.out<-out2$summary.hyperpar[,c("mean", "sd", "0.025quant", "0.975quant")]
+random.out<-signif(random.out, digits = 4)
+random.out$Species <- sp.list[m]
+names(random.out)[1:5] <- c("mean", "SD", "0.025quant", "0.975quant", "Speices")
+
+write.table(random.out, paste(out.dir, "Random_Summary.csv"), row.names = TRUE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+#Random class
+
+class_ID<-out2$summary.random$class[,"ID"]
+class_mean<-exp(out2$summary.random$class$`0.5quant`)
+class_ll<-exp(out2$summary.random$class$`0.025quant`)
+class_ul<-exp(out2$summary.random$class$`0.975quant`)
+class_iw <- class_ul - class_ll
+
+class_results<-data.frame(class_ID, class_mean, class_ll, class_ul, class_iw)
+
+class_results$Species<-sp.list[m]
+
+write.table(class_results, paste(out.dir, "RandomClass_Summary.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+##Remove cells with no routes
+cells_with_counts <- unique(sp.data$alpha_i[which(!is.na(sp.data$maxcount))])
+
+# get alpha summaries
+alph <- exp(out2$summary.random$alpha_i$`0.5quant`[cells_with_counts])
+alph_ll <- exp(out2$summary.random$alpha_i$`0.025quant`[cells_with_counts])
+alph_ul <- exp(out2$summary.random$alpha_i$`0.975quant`[cells_with_counts])
+alph_iw <- alph_ul - alph_ll
+
+# get tau summaries
+tau <- (exp(out2$summary.random$tau_i$`0.5quant`[cells_with_counts])
+        - 1) * 100
+tau_ll <- (exp(out2$summary.random$tau_i$`0.025quant`[cells_with_counts])
+           - 1) * 100
+tau_ul <- (exp(out2$summary.random$tau_i$`0.975quant`[cells_with_counts])
+           - 1) * 100
+tau_iw <- tau_ul - tau_ll
+
+
+##-----------------------------------------------------------
+#time series plots per cell
+#calculate cell level index of abundance
+
+#create a loop to get abundance index output per cell-year
+
+for(k in 1:length(cells_with_counts)) {
+
+#k<-1 #for testing each cell
+   
+  cell1 <-NULL 
+  cell1 <- cells_with_counts[k]
+  
+#need to back assign the factor cell1 to its original grid_id
+cell_id<-sp.data %>% ungroup() %>% dplyr::select(basin, alpha_i) %>% distinct()
+grid1<- as.character(cell_id[k,"basin"])
+ 
+#median 
+   d0 <- out2$summary.random$alpha_i$`0.5quant`[cell1]
+   d1 <- out2$summary.random$tau_i$`0.5quant`[cell1]
+   d2 <- data.frame(
+   styear=as.numeric(gsub(paste0(cell1,"-"), "",
+                        grep(paste0("\\b",cell1,"-"),
+                             out2$summary.random$gamma_ij$ID,
+                                  value=TRUE)))- max.yr, gamma_ij=
+     out2$summary.random$gamma_ij$`0.5quant`[grep(
+       paste0("\\b",cell1,"-"), out2$summary.random$gamma_ij$ID)]) %>%
+     arrange(styear)
+   d2$x0 <- d0
+   d2$x1 <- d2$styear*d1
+   d2$abund <- exp(d2$x0 + d2$x1 + d2$gamma_ij)
+   d2$cell<-cell1
+   d2<-merge(d2, grid_key, by.x="cell", by.y="alpha_i")
+   d2$taxa_code<-sp
+   
+   d3<-d2 %>% select(basin, taxa_code, styear, abund) %>% mutate(year=styear+2021) %>% select(-styear)
+ 
+#lci     
+   l0 <- out2$summary.random$alpha_i$`0.025quant`[cell1]
+   l1 <- out2$summary.random$tau_i$`0.025quant`[cell1]
+   l2 <- data.frame(
+   styear=as.numeric(gsub(paste0(cell1,"-"), "",
+                        grep(paste0("\\b",cell1,"-"),
+                             out2$summary.random$gamma_ij$ID,
+                                  value=TRUE)))- max.yr, gamma_ij=
+     out2$summary.random$gamma_ij$`0.025quant`[grep(
+       paste0("\\b",cell1,"-"), out2$summary.random$gamma_ij$ID)]) %>%
+     arrange(styear)
+   l2$x0 <- l0
+   l2$x1 <- l2$styear*l1
+   l2$abund_lci <- exp(l2$x0 + l2$x1 + l2$gamma_ij)
+   l2$cell<-cell1
+   l2<-merge(l2, grid_key, by.x="cell", by.y="alpha_i")
+   
+  l3<-l2 %>% select(basin, styear, abund_lci) %>% mutate(year=styear+2021) %>% select(-styear) 
+
+#uci  
+ u0 <- out2$summary.random$alpha_i$`0.975quant`[cell1]
+   u1 <- out2$summary.random$tau_i$`0.975quant`[cell1]
+   u2 <- data.frame(
+   styear=as.numeric(gsub(paste0(cell1,"-"), "",
+                        grep(paste0("\\b",cell1,"-"),
+                             out2$summary.random$gamma_ij$ID,
+                                  value=TRUE)))- max.yr, gamma_ij=
+     out2$summary.random$gamma_ij$`0.975quant`[grep(
+       paste0("\\b",cell1,"-"), out2$summary.random$gamma_ij$ID)]) %>%
+     arrange(styear)
+   u2$x0 <- u0
+   u2$x1 <- u2$styear*u1
+   u2$abund_uci <- exp(u2$x0 + u2$x1 + u2$gamma_ij)
+   u2$cell<-cell1
+   u2<-merge(u2, grid_key, by.x="cell", by.y="alpha_i")
+   
+u3<-u2 %>% select(basin, styear, abund_uci) %>% mutate(year=styear+2021) %>% select(-styear)   
+
+d3<-merge(d3, l3, by=c("basin", "year"))
+d3<-merge(d3, u3, by=c("basin", "year"))
+
+write.table(d3, paste(out.dir, "AnnualIndex.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = FALSE)
+   
+   } #end cell specific loop
+
+
+##-----------------------------------------------------------
+#Explore posterior samples 
+
+grid2<-grid_key %>% filter(alpha_i==cells_with_counts)
+
+posterior_ss <- 1000 # change as appropriate
+samp1 <- inla.posterior.sample(posterior_ss, out2, num.threads=3)
+par_names <- as.character(attr(samp1[[1]]$latent, "dimnames")[[1]])
+post1 <- as.data.frame(sapply(samp1, function(x) x$latent))
+post1$par_names <- par_names
+ 
+# tau samples
+tau_samps1 <- post1[grep("tau_i", post1$par_names), ]
+row.names(tau_samps1) <- NULL
+tau_samps1 <- tau_samps1[cells_with_counts, 1:posterior_ss]
+tau_samps1 <- (exp(tau_samps1) - 1) * 100
+tau_samps2 <- cbind(grid2, tau_samps1)
+row.names(tau_samps2) <- NULL
+val_names <- grep("V", names(tau_samps2))
+
+#tau_prov
+#not weighted for basin area. New calculation provided below using PosteriorSummary outputs. 
+tau_prov <- tau_samps2 %>%
+  ungroup() %>%  #this seems to be needed before the select function or it won't work
+  dplyr::select(StateProvince, val_names) %>%
+  mutate(StateProvince=factor(StateProvince)) %>%
+  gather(key=key, val=val, -StateProvince) %>%
+  dplyr::select(-key) %>%
+  group_by(StateProvince) %>%
+  summarise(med_tau=median(val), lcl_tau=quantile(val, probs=0.025),
+            ucl_tau=quantile(val, probs=0.975), iw_tau=ucl_tau-lcl_tau,
+            n=n()/posterior_ss); head(tau_prov)
+tau_prov$taxa_code <- sp.list[m]
+
+
+write.table(tau_prov, paste(out.dir, "Tau_All.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = FALSE)
+
+# alpha samples
+alpha_samps1 <- post1[grep("alpha_i", post1$par_names), ]
+row.names(alpha_samps1) <- NULL
+alpha_samps1 <- alpha_samps1[cells_with_counts, 1:posterior_ss]
+alpha_samps1 <- exp(alpha_samps1) 
+alpha_samps2 <- cbind(grid2, alpha_samps1)
+row.names(alpha_samps2) <- NULL
+val_names <- grep("V", names(alpha_samps2))
+
+#alpha_prov
+#not weighted for basin area. New calculation provided below using PosteriorSummary outputs.
+alpha_prov <- alpha_samps2 %>%
+  ungroup() %>%  #this seems to be needed before the select function or it won't work
+  dplyr::select(StateProvince, val_names) %>%
+  mutate(StateProvince=factor(StateProvince)) %>%
+  gather(key=key, val=val, -StateProvince) %>%
+  dplyr::select(-key) %>%
+  group_by(StateProvince) %>%
+  summarise(med_alpha=median(val), lcl_alpha=quantile(val, probs=0.025),
+            ucl_alpha=quantile(val, probs=0.975), iw_alpha=ucl_alpha-lcl_alpha,
+            n=n()/posterior_ss); head(alpha_prov)
+alpha_prov$taxa_code <- sp.list[m]
+  
+write.table(alpha_prov, paste(out.dir, "Alpha_All.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = FALSE)
+
+##-----------------------------------------------------------
+#Collect posterior summaries into one data frame
+
+post_sum<-NULL
+post_sum <- data.frame(alpha_i=cells_with_counts,
+                       alph, alph_ll, alph_ul, alph_iw,
+                       #eps, eps_ll, eps_ul, eps_iw, eps_sig=NA,
+                       tau, tau_ll, tau_ul, tau_iw, tau_sig=NA)
+post_sum$tau_sig <- ifelse((post_sum$tau_ll < 1 & post_sum$tau_ul > 1),
+                           post_sum$tau_sig <- 0,
+                           post_sum$tau_sig <- post_sum$tau)
+
+
+#need to back assign the factor alpha_id to its original value
+id_grid<-sp.data %>% ungroup() %>% dplyr::select(alpha_i, basin) %>% distinct()
+post_sum<-merge(post_sum, cell_id, by="alpha_i")
+post_sum$taxa_code<-sp
+
+
+write.table(post_sum, paste(out.dir, "PosteriorSummary.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = FALSE)
+
+##-----------------------------------------------------------
+#Model prediction/ interpretation
+#Develop linear combinations
+
+#write species data
+
+write.table(sp.data, paste(out.dir, sp.list[m],".csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+
+#lake level
+mydata<-data.frame(pcntag=mean(dat$pcntag), 
+                  pcntdev=mean(dat$pcntdev), 
+                  PerWetland=mean(dat$PerWetland), 
+                  lakelevel=seq(from=-2.43, to=1.517, length=25) 
+                   )
+Xmat<-model.matrix(~-1+pcntag+pcntdev+lakelevel+PerWetland, data=mydata)
+Xmat<-as.data.frame(Xmat)
+
+lcb<-inla.make.lincombs(Xmat)
+
+lcb_lake<- inla(f2, family=fam, data=sp.data,
+                lincomb=lcb, 
+                control.predictor=list(compute=TRUE, quantiles=c(0.025, 0.975)), verbose=TRUE)
+
+#get the predicted values
+Pred.marg<-lcb_lake[["marginals.lincomb.derived"]]
+
+# now we need to back transform the values
+mydata$mu<-unlist(lapply(Pred.marg, function(x) inla.emarginal(exp, x)))
+mydata$LCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.025), inla.tmarginal(exp,x))))
+mydata$UCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.975), inla.tmarginal(exp,x))))
+
+write.table(mydata, paste(out.dir, sp.list[m],"LakeLevelEffect.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+#pcntdev
+mydata<-NULL
+mydata<-data.frame(pcntdev=seq(from=0, to=1, length=25), 
+                  pcntag=mean(dat$pcntag), 
+                  PerWetland=mean(dat$PerWetland), 
+                  lakelevel=0)
+Xmat<-model.matrix(~-1+pcntag+pcntdev+lakelevel+PerWetland, data=mydata)
+Xmat<-as.data.frame(Xmat)
+
+lcb<-inla.make.lincombs(Xmat)
+
+lcb_dev<- inla(f2, family=fam, data=sp.data,
+                lincomb=lcb, 
+                control.predictor=list(compute=TRUE, quantiles=c(0.025, 0.975)), verbose=TRUE)
+
+#get the predicted values
+Pred.marg<-lcb_dev[["marginals.lincomb.derived"]]
+
+# now we need to back transform the values
+mydata$mu<-unlist(lapply(Pred.marg, function(x) inla.emarginal(exp, x)))
+mydata$LCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.025), inla.tmarginal(exp,x))))
+mydata$UCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.975), inla.tmarginal(exp,x))))
+
+write.table(mydata, paste(out.dir, sp.list[m],"PcntDevelopEffect.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+#pcntag
+mydata<-NULL
+mydata<-data.frame(pcntag=seq(from=0, to=1, length=25), 
+                  pcntdev=mean(dat$pcntdev), 
+                  PerWetland=mean(dat$PerWetland), 
+                  lakelevel=0)
+Xmat<-model.matrix(~-1+pcntag+pcntdev+lakelevel+PerWetland, data=mydata)
+Xmat<-as.data.frame(Xmat)
+
+lcb<-inla.make.lincombs(Xmat)
+
+lcb_ag<- inla(f2, family=fam, data=sp.data,
+                lincomb=lcb, 
+                control.predictor=list(compute=TRUE, quantiles=c(0.025, 0.975)), verbose=TRUE)
+
+#get the predicted values
+Pred.marg<-lcb_ag[["marginals.lincomb.derived"]]
+
+# now we need to back transform the values
+mydata$mu<-unlist(lapply(Pred.marg, function(x) inla.emarginal(exp, x)))
+mydata$LCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.025), inla.tmarginal(exp,x))))
+mydata$UCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.975), inla.tmarginal(exp,x))))
+
+write.table(mydata, paste(out.dir, sp.list[m],"PcntAgriEffect.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+#PerWetland
+mydata<-NULL
+mydata<-data.frame(PerWetland=seq(from=0, to=1, length=25), 
+                  pcntag=mean(dat$pcntag), 
+                  pcntdev=mean(dat$pcntdev), 
+                  lakelevel=0)
+Xmat<-model.matrix(~-1+pcntag+pcntdev+lakelevel+PerWetland, data=mydata)
+Xmat<-as.data.frame(Xmat)
+
+lcb<-inla.make.lincombs(Xmat)
+
+lcd_wet<- inla(f2, family=fam, data=sp.data,
+                lincomb=lcb, 
+                control.predictor=list(compute=TRUE, quantiles=c(0.025, 0.975)), verbose=TRUE)
+
+#get the predicted values
+Pred.marg<-lcd_wet[["marginals.lincomb.derived"]]
+
+# now we need to back transform the values
+
+mydata$mu<-unlist(lapply(Pred.marg, function(x) inla.emarginal(exp, x)))
+mydata$LCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.025), inla.tmarginal(exp,x))))
+mydata$UCI<-unlist(lapply(Pred.marg, function(x) inla.qmarginal(c(0.975), inla.tmarginal(exp,x))))
+
+write.table(mydata, paste(out.dir, sp.list[m],"PcntWetlandEffect.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = TRUE)
+
+} #end species loop
+
+```
+
+
+#Summarize results using outputs
+
+```{r plot index}
+
+out.dir<-"Output/"
+
+index<-read.csv("Output/ AnnualIndex.csv")
+index<-index %>% na.omit()
+index$basin<-as.factor(index$basin)
+index$year<-as.integer(index$year)
+
+ggplot(index, aes(x=year, y=abund, color=basin))+
+  geom_point()+
+  geom_errorbar(aes(ymin=abund_lci, ymax=abund_cui))+
+  geom_smooth(method=loess, fill=NA, span=0.5)+
+ # geom_smooth(method=lm, fill=NA)+
+  facet_wrap(taxa_code~., scales="free")+
+  #facet_wrap(taxa_code~.,)+
+  scale_y_continuous(trans='log10') + annotation_logticks()+
+  xlab("Year")+ylab("Index of Abundance (log scale)")+
+  theme_classic()
+ # scale_color_grey(start = 0.8, end = 0.2) 
+
+
+#plot raw mean abundance and predictor values. 
+index.raw<-dat %>% group_by(taxa_code, basin, year) %>% summarize(index.raw=mean(maxcount))
+
+index<-left_join(index, index.raw, by=c("basin", "year", "taxa_code"))
+
+ggplot(index, aes(x=index.raw, y=abund, color=basin))+
+  geom_point()+
+  geom_smooth(method=lm, fill=NA)+
+  facet_wrap(taxa_code~., scales="free")+
+  theme_classic()
+
+#determine how many trends are significant within a given basin
+sig<-read.csv("OUtput/ PosteriorSummary.csv")
+sig<-sig %>% mutate(sigpos=ifelse(tau_sig>0, 1, 0))
+sig<-sig %>% mutate(signeg=ifelse (tau_sig<0, 1, 0))
+sig<-sig %>% group_by(basin) %>% summarize(nsp=n_distinct(taxa_code), possig=sum(sigpos), negsig=sum(signeg))
+
+#assess covariate
+cov<-read.csv("Output/CovariatePlot.csv")
+cov<-cov %>% mutate(sigpos = ifelse(LCI>0 & UCI>0, 1, 0), signeg=ifelse(LCI<0 & UCI<0, 1, 0))
+cov_sum<-cov %>% group_by(Covariate) %>% summarize(nsigpos=sum(sigpos), nsigneg=sum(signeg))
+
+#make an output table with common and scientific names
+sp.names<-species_code_search()
+sp.names<-sp.names %>% select(english_name, scientific_name, BSCDATA)
+BSCDATA<-(unique(cov$Speices))
+BSCDATA<-as.data.frame(BSCDATA)
+sp.names<-left_join(BSCDATA, sp.names, by="BSCDATA")
+
+write.csv(sp.names, "SpeciesNames.csv")
+
+```
+
+#Plot covariate values on predicted values 
+
+```{r plot predict}
+
+library(cowplot)
+
+out.dir<-"Output/"
+index<-na.omit(index)
+sp.list<-unique(index$taxa_code)
+
+for(m in 1:length(sp.list)) {
+
+  sp.dat<-read.csv(paste("Output/", " ",sp.list[m], " .csv", sep=""))
+  
+  agri.dat<-read.csv(paste("Output/", " ",sp.list[m], " PcntAgriEffect.csv", sep=""))
+
+agri.plot<-ggplot()+
+       geom_ribbon(data=agri.dat, aes(x= pcntag, ymin=LCI, ymax=UCI), fill="grey80")+
+     geom_line(data=agri.dat, aes(y=mu, x=pcntag))+
+    geom_point(data=sp.dat, aes(y=maxcount, x=pcntag))+
+    theme_classic()+
+    xlab("Percent agriculture")+
+    ylab("Max Count")
+
+ dev.dat<-read.csv(paste("Output/", " ",sp.list[m], " PcntDevelopEffect.csv", sep=""))
+
+dev.plot<-ggplot()+
+       geom_ribbon(data=dev.dat, aes(x= pcntdev, ymin=LCI, ymax=UCI), fill="grey80")+
+     geom_line(data=dev.dat, aes(y=mu, x=pcntdev))+
+    geom_point(data=sp.dat, aes(y=maxcount, x=pcntdev))+
+    theme_classic()+
+    xlab("Percent developed")+
+    ylab("Max Count")
+  
+ wet.dat<-read.csv(paste("Output/", " ",sp.list[m], " PcntWetlandEffect.csv", sep=""))
+
+wet.plot<-ggplot()+
+       geom_ribbon(data=wet.dat, aes(x= PerWetland, ymin=LCI, ymax=UCI), fill="grey80")+
+     geom_line(data=wet.dat, aes(y=mu, x=PerWetland))+
+    geom_point(data=sp.dat, aes(y=maxcount, x=PerWetland))+
+    theme_classic()+
+    xlab("Percent wetland")+
+    ylab("Max Count")
+
+ lake.dat<-read.csv(paste("Output/", " ",sp.list[m], " LakeLevelEffect.csv", sep=""))
+
+lake.plot<-ggplot()+
+       geom_ribbon(data=lake.dat, aes(x= lakelevel, ymin=LCI, ymax=UCI), fill="grey80")+
+     geom_line(data=lake.dat, aes(y=mu, x=lakelevel))+
+    geom_point(data=sp.dat, aes(y=maxcount, x=lakelevel))+
+    theme_classic()+
+    xlab("Variation in Lake level")+
+    ylab("Max Count")
+    
+plot4<-plot_grid(agri.plot, dev.plot, wet.plot, lake.plot)
+
+#print plot and then turn device off
+pdf(paste(out.dir, sp.list[m], ".PredictedEffectPlot.pdf", sep=""))
+  try(print(plot4, silent=T))
+while(!is.null(dev.list())) dev.off()
+  
+}#end sp loop
+
+```
+
+#Basin area weighted composite trend outputs 
+
+```{r}
+
+all_comb<- as.data.frame(matrix(data = NA, nrow = 1, ncol = 10, byrow = FALSE, dimnames = NULL))
+names(all_comb) <- c("taxa_code","med_alph", "lcl_alph", "ucl_alph", "iw_alph", "med_tau", "lcl_tau", "ucl_tau", "iw_tau", "n")
+write.table(all_comb, file = paste(out.dir, "CompositeOutputs.csv"), row.names = FALSE, append = FALSE, quote = FALSE, sep = ",")
+
+postsum<-read.csv("Output/ PosteriorSummary.csv")
+area<-read.csv("Data/BasinArea.csv")
+
+postsum<-merge(postsum, area, by.x="basin", by.y="lake")
+
+sp.list<-unique(postsum$taxa_code)
+
+for(m in 1:length(sp.list)) {
+  
+#m<-1  #for testing   
+
+  com.data<-NULL
+  com.data <- filter(postsum, taxa_code == sp.list[m]) %>%
+      droplevels()
+  
+#sum to one area (i.e., percent)
+com.data<-com.data %>% mutate(totbasin=sum(basinAreaKm2), perbasin=basinAreaKm2/totbasin) %>% select(-watershedAreaKm2, -basinAreaKm2, -totbasin)
+
+##Weighted average https://www.wikihow.com/Calculate-Weighted-Average
+
+#pool estimates
+tau_prov <- com.data %>%
+    summarise(med_tau=weighted.mean(tau, perbasin), lcl_tau=weighted.mean(tau_ll, perbasin),
+            ucl_tau=weighted.mean(tau_ul, perbasin), iw_tau=ucl_tau-lcl_tau,
+            n=n_distinct(basin))
+tau_prov$taxa_code <- sp.list[m]
+
+
+alph_prov <- com.data %>%
+    summarise(med_alph=weighted.mean(alph, perbasin), lcl_alph=weighted.mean(alph_ll, perbasin),
+            ucl_alph=weighted.mean(alph_ul, perbasin), iw_alph=ucl_alph-lcl_alph)
+alph_prov$taxa_code <- sp.list[m]
+
+com.data<-merge(alph_prov, tau_prov, by="taxa_code")
+
+write.table(com.data, paste(out.dir, "CompositeOutputs.csv"), row.names = FALSE, append = TRUE, quote = FALSE, sep = ",", col.names = FALSE)
+  
+
+} #end species list
+
+```

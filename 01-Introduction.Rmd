@@ -1,0 +1,20 @@
+---
+title: "01-Introduction"
+author: "Danielle Ethier"
+date: '2022-06-11'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+[Great Lakes Coastal Wetland Monitoring Program (CWMP)](https://www.greatlakeswetlands.org/Home.vbhtml) is a program dedicated to monitoring coastal wetland biota, habitat, and water quality to provide information on conditions for fish, birds, calling anurans, wetland vegetation, aquatic macroinvertebrates, and water quality. The R script detailed herein focuses on the bird data. 
+
+Date Range: 2011-2021
+
+Bird Sampling: 10-minute, unlimited-distance point counts of breeding marsh birds are completed by trained and tested CWMP field investigators. Bird surveys were conducted twice a year between late May and the first half of July at each survey point: once in the morning (between 0.5 h before sunrise and 4 h after sunrise) and once in the evening (between 4 h before sunset and 0.5 h after sunset). Each point count was separated by at least 10–15 days. The first 5 min of the point count period consisted of passive listening, followed by a 5-minute broadcast of secretive marsh-nesting bird calls (least bittern, sora, Virginia rail, American coot, common gallinule, and pied-billed grebe) and another 5-minute period of passive listening. Observers recorded all birds seen or heard. Bird surveys were conducted during favorable weather conditions with winds <20 km/hr and little to no precipitation.
+
+Great Lakes coastal wetlands can also be classified into three types: lacustrine, barrier-protected, and riverine, each defined by its hydrologic connection to the lake, geomorphic position, and dominant hydrologic source. Lacustrine wetlands are most directly influenced by Great Lakes water levels since they are positioned along the shoreline; riverine wetlands occur along rivers or streams that flow into a Great Lake; and barrier-protected wetlands are similar to lacustrine wetlands but are separated from the lake by a barrier, such as a beach or dike. 
+
+The original R code were created by Danielle Ethier, Population Scientist with Birds Canada. 
+
+Modification Date: April 2023

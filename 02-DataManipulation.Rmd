@@ -1,0 +1,493 @@
+---
+title: "02-DataManipulation"
+author: "Danielle Ethier"
+date: '2022-06-11'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#Load Directories and Libraries
+
+```{r load}
+
+library(tidyverse)
+library(reshape)
+
+library(corrplot)
+
+library(rgdal)
+library(sf)
+library(ggmap)
+library(leaflet)
+library(mapview)
+library(rnaturalearth)
+
+
+out.dir <- paste("Output/")
+dat.dir <- paste("Data/")
+```
+
+Bird and anuran data are downloaded from the [CWMP](https://www.greatlakeswetlands.org/Home.vbhtml) website in `.xlsx` format. There are multiple tabs per spreadsheet, some which contain the metadata and others the raw data (points and obs). 
+
+The site metadata files was provided separately by Doug Tozer. If a new files is needed, Doug or another member of the CWMP team should be contacted directly: dtozer@birdscanada.org
+
+What we will want to load into RStudio is the raw data, which are save in `.csv` format and in the `Data` directory in this R Project folder. If you need to update this analysis, simply re-save the raw data with the same file names in the `Data` folder. 
+
+#Load data and join tables
+
+```{r data}
+
+#Load data
+bpoint<-read.csv("Data/bird_points.csv")
+bobs<-read.csv("Data/bird_obs.csv")
+site<-read.csv("Data/cwmp_master_site_table_june2022.csv")
+
+#Rename the `time` fields since they have the same name in both files, but mean something different in each. 
+bpoint<-bpoint %>% dplyr::rename(start_time=time)
+bobs<-bobs %>% dplyr::rename(interval=time)
+
+#change site to site_id 
+site<-site %>% mutate(site_id=site) %>% select(-site)
+
+#Join tables 
+bird_dat<-left_join(bobs, bpoint, by=c("site_id", "crew_name", "year", "date", "sample", "point_id", "qa_done", "quar_flag", "longitude", "latitude", "coord_qual", "comments"))
+
+```
+
+Take a tour of the data to learn about its characteristics. Derive some summary stats to help you understand the data structure.  
+
+#Data exploration
+
+```{r datatour}
+
+#How many year has each sites been run? #How many points per site? 
+sites<-bird_dat %>% group_by(site_id) %>% dplyr::summarize(siteyr=n_distinct(year), npoint=n_distinct(point_id)) 
+
+mean(sites$siteyr) #2.27
+range(sites$siteyr) #1-10
+mean(sites$npoint) #2.58
+range(sites$npoint) #1-17
+
+hist(sites$siteyr) #There are a lot of sites that have only been run once or twice
+hist(sites$npoint)
+
+#How many unique lat longs per points? 
+latlong<-bird_dat %>% group_by(site_id, point_id) %>% dplyr::summarize(nlat=n_distinct(latitude), nlong=n_distinct(longitude), nyear=n_distinct(year))
+
+#How may missing lat longs?
+miss_ll<-bird_dat %>% group_by(site_id, point_id) %>% filter(is.na(latitude)) #2005 missing lat and long. Will want to rectify this issue. 
+
+#Did you want to consider an observer effect?
+length(unique(bird_dat$observer)) # 66 unique observers
+obs<-bird_dat %>% group_by(observer) %>% dplyr::summarize(obsyr=n_distinct(year))
+hist(obs$obsyr) #there are a lot of first year observers
+
+#Do some observers survey multiple sites? 
+length(unique(bird_dat$site_id)) # 793 unique sites
+obs2<-bird_dat %>% group_by(observer) %>% dplyr::summarize(obssite=n_distinct(site_id))
+hist(obs2$obssite)#there are a lot of observers that survey multiple sites. Likely because they are paid employees and not volunteers.
+
+```
+
+What this summary tells me is that a lat and long are not unique to the point_id within a site. It appears that a surveyor takes a new lat and long each year which is less efficient than working from fixed point count locations. We will need to assign a single lat&long per site_id (or point_id) for the analysis. Doug shared the master site list, which should have unique lat and long for each site ID. 
+
+There are a lot of observers that survey multiple point per year, but there are also a lot of observers that only survey for one year. We may consider including an `observer-site` random effect in the model. We might also want to have a first-year observer effect if we anticipate that first year observers are less proficient. 
+
+#Data cleaning
+
+There is a modifier `M` on some of the point_ids. Doug suggest these are site who's locations needed to be modified slightly within a given year. I will remove the modifier assuming they are close enough. 
+
+```{r mdrop}
+
+bird_dat<-bird_dat %>% mutate(point=ifelse(point_id=="1M", "1", ifelse(point_id=="2M", "2", ifelse(point_id=="3M", "3", ifelse(point_id=="4M", "4", ifelse(point_id=="5M", "5", ifelse(point_id=="6M", "6", ifelse(point_id=="8M", "8", ifelse(point_id=="1MA", "1", point_id))))))))) %>% select(-point_id) 
+
+bird_dat<-bird_dat %>% dplyr::rename(point_id=point)
+
+```
+
+Site 5755 is missing lat and longs. There doesn't appear to be any in the database for any year. Doug confirmed that this is a data entry error and they site should be 5735. 
+
+```{r sitefix}
+
+bird_dat<-bird_dat %>% mutate(site_id=ifelse(site_id=="5755", "5735", site_id))
+
+```
+
+Now join to the master site file. 
+
+```{r masterjoin}
+
+bird_dat<-bird_dat %>% select(-latitude, -longitude, -drw_flag, -drw_notes)
+
+bird_dat$site_id<-as.integer(bird_dat$site_id)
+
+bird_dat<-left_join(bird_dat, site, by="site_id")
+
+```
+
+#Interval 0-10 min only
+
+Since the sampling changes in 2019 from 15 min to 10 min we want to remove any data that were collects after in the interval >10. But first, we have to separate the interval row at the first comma and only keep the time to first detection. Missing interval associated with aerial foragers, and therefore removed.  
+
+```{r interval}
+
+bird_dat$int<-sub(",.*", " ", bird_dat$interval)
+bird_dat$int<-as.numeric(bird_dat$int)
+bird_dat<-bird_dat %>% filter(int<10) %>% select(-interval) 
+
+```
+
+#Sites surveyed per year summary
+
+```{r sitesurvey}
+
+site_sum<-bird_dat %>% select(site_id, year) %>% distinct() %>% mutate(value="x")
+
+site_sum<-cast(site_sum, site_id~year, value="value")
+
+nyear<-bird_dat %>% group_by(site_id) %>% summarise(nyears=n_distinct(year))
+
+site_sum<-left_join(site_sum, nyear, by="site_id")
+
+write.csv(site_sum, "Output/Summary_SiteSumYear.csv")
+
+```
+
+#Types of sites surveyed per year (i.e., class)
+
+```{r siteclass}
+
+site_class<-bird_dat %>% group_by(class, year) %>% summarise(nsites=n_distinct(site_id))
+site_class<-cast(site_class, class~year, value="nsites")
+
+write.csv(site_class, "Output/Summary_ClassYear.csv")
+
+```
+
+There seems to be good sample sized for each class type in each year. 
+
+#Assing each site to a watershed sub-basin
+
+Using the GIS shape file provided, lets assign each site to a Great Lakes Watershed. 
+
+```{r watershed}
+
+#Load GIS layer
+watershed<-readOGR(dsn="Data", layer="greatlakes_subbasins")
+
+#Make list into spatial coordinates
+pts <- SpatialPoints(coords = cbind(bird_dat$lon, bird_dat$lat))
+proj4string(pts) <- CRS("+proj=longlat +datum=WGS84 +no_defs") 
+
+#plot(watershed)
+#plot(pts_proj)
+
+#Project points to be the same datum as the National Blocks layers
+pts_proj <- spTransform(pts, CRS("+proj=longlat +ellps=GRS80 +no_defs"))
+
+# Overlay the points on sub basins layer, and extract the sub basin codes
+ 
+pts_blk <- over(pts_proj, watershed[,"merge"])
+
+#Assign the basin ID back to the original data
+bird_dat$basin<-pts_blk$merge
+
+#Assign the NA to lk_ont since they are along the St. Laurence River
+
+bird_dat$basin[is.na(bird_dat$basin)] = "lk_ont"
+
+```
+
+#Assign each site to a BCR or Region
+
+At first we were assigning each sample point to a BCR-Basin intersect to assign out of range, but then Doug created a unique puzzle to do this more accurately. The shape file is saved in the `Data` folder called `puzzelPieces.shp` but the near assignment was done in ArcGIS because some of the sample points fall outside the bounds of the .shp file. The old BCR code is still currently retained but could be deleted if found to be obsolete. 
+
+```{r region}
+
+#read BCR file
+#bcr<-read.csv("Data/BCR.csv")
+#bcr<-bcr %>% dplyr::rename(site_id=site) %>% select(-name, -label)
+#bird_dat<-left_join(bird_dat, bcr, by=c("site_id"))
+
+
+#read region file 
+region<-read.csv("Data/rangematrix.csv")
+region<-region %>% dplyr::rename(site_id=site, region=label2)
+bird_dat<-left_join(bird_dat, region, by=c("site_id"))
+
+```
+
+#Types of sites surveyed per year (i.e., class)
+
+```{r siteclass}
+
+site_basin<-bird_dat %>% group_by(basin, year) %>% summarise(nsites=n_distinct(site_id))
+site_basin<-cast(site_basin, basin~year, value="nsites") %>% na.omit()
+
+write.csv(site_basin, "Output/Summary_BasinYear.csv")
+
+```
+
+There seems to be good sample sized for each class type in each year. 
+
+#Plot route locations and number of years surveyed 
+
+```{r plot}
+
+#Plot data point locations
+plot_data<-bird_dat %>% group_by(site_id, lat, lon) %>% dplyr::summarize(siteyr=n_distinct(year)) 
+
+#Create spatial data
+plot <- bird_dat %>% select("lon", "lat")%>% distinct()
+plot_sf <- st_as_sf(plot, coords = c("lon", "lat"), crs = 4326)
+
+#Create the base layer map
+map <- get_stamenmap(bbox = as.numeric(st_bbox(plot_sf)), zoom = 5)
+
+#Create a new plot for each year
+plot<-ggmap(map) + 
+  geom_point(data = plot_data, aes(x = lon, y = lat, size=siteyr, colour=siteyr))
+print(plot)
+
+```
+
+#Events Matrix
+
+In order to properly zero-fill the data frame, we need an `events` matrix, which tells us when if a point was surveyed within a given year.The creation of an events matrix assumes that at least one bird (target or non-target) was detected per point count, which is likely a safe assumption to make. Because the final response variable is max count per point, `sample` is not included in the events matrix. However, to properly zero fill the occurrence dataframe to run summary statistics you need a difference events matrix which includes sample. This is create later and does not include the site-level covaraites.  
+
+#Site-level covaraites
+
+We will also include our site level covariates in the events data table. 
+
+(1) We include the watershed risk indicators from Host et al. (2019): "Risk-based classification and interactive map of watersheds contributing anthropogenic stress to Laurentian Great Lakes coastal ecosystems George". The data are in the `Data` folder and the watershed layers can be found online here: https://www.glahf.org/watersheds/. Note that some of the station points fell outside the watershed polygon. The near tool was used in ArcGIS to assign the stations to the nearest polygon. 
+
+(2) We include the watershed percentage around each point, which is also in the `Data` folder and was calculated in ArcGIS using the `glcwc_cwi_polygon.shp` file. 
+
+(3) We include the yearly lake levels from 2011 to 2021 downloaded from NOAA. We select to use the mean yearly lake level from May to July as the index since this overlaps with the breeding/ sampling period. The lake levels are standardized for each Lake separately, since the reference value is the same for all lakes (which are not at the same heights).  
+
+
+```{r events}
+
+events<-NULL
+events<-bird_dat %>% select(site_id, point_id, year, lat, lon, class, basin, region, area_ha) %>% distinct(site_id, point_id, year, .keep_all = TRUE)
+
+#1. Load and process risk data
+
+near<-NULL
+near<-read.csv("Data/NearTable.csv")
+risk<-NULL
+risk<-read.csv("Data/ws_agdev_2000-2010.csv")
+
+near<-near %>% select(site, GLHDID) %>% dplyr::rename(site_id=site)
+
+risk<-risk %>% select(GLHDID, totalcells, pcntag10, pcntdev10)
+#scale percent 0-1
+risk<-risk %>% mutate(pcntag=pcntag10/100, pcntdev=pcntdev10/100) %>% select(-pcntag10, -pcntdev10, -totalcells)
+
+risk<-left_join(near, risk, by="GLHDID")
+
+#join with the events data
+events<-left_join(events, risk, by=c("site_id"))
+
+#2. Load the percent wetland data
+
+wet<-NULL
+wet<-read.csv("Data/PercentWetland.csv")
+wet<-wet %>% dplyr::rename(site_id=CWMP_Sites, pcntwet= PerWetland)
+
+#join with the events data
+events<-left_join(events, wet, by=("site_id"))
+
+#there are 24 sites with missing wetland information. These sites have 0 percent wetland associated with them and therefore the NA will be replaced with zero. This is due to known imperfections with the shape file and is therefore an artifact. That said, these wetland are likely proportionally very small and therefore close to zero. Note: I manually duplicated MichiganHuron into separate rows in the table since these are at the same level. 
+
+events<-events %>% mutate(PerWetland  = ifelse(is.na(pcntwet), 0, pcntwet)) %>% select(-pcntwet)
+
+#3. Load Great Lakes water levels 
+
+level<-read.csv("Data/GLWaterLevel .csv")
+level<-level %>% mutate(basin = recode(lake, erie = "lk_erie", michigan="lk_mich", huron="lk_huron", ontario="lk_ont", superior="lk_sup")) %>% mutate(mean=((may+jun+jul)/3)) %>% select(basin, year, mean) 
+
+level<-level %>% group_by(basin) %>% mutate(lakelevel=scale(mean)) %>% select(-mean)
+level<-as.data.frame(level)
+
+#test plot
+#ggplot(level, aes(x=year, y=mean.sd, colour=basin))+
+#  geom_line(size=2)+
+#  theme_classic()+
+#  xlab("Year")+
+#  ylab("Mean lake level May-Jule (scaled per lake)")
+
+#detrend this variable
+m1<-lm(lakelevel~year, data=level)
+level$lakepredict<-predict(m1)
+level$lakedetrend<-level$lakelevel-level$lakepredict
+level<-level %>% select(-lakelevel, -lakepredict)
+
+#join with the events data
+events<-left_join(events, level, by=c("year", "basin"))
+
+write.csv(events, "Output/Events.csv")
+
+```
+
+#Species List 
+
+If following the lead of Hohman et al (2021: Table 4) we will not include all species in the analysis. We first through we would restrict our species list to include 13 marsh-obligate breeding bird species that only nest in open wetlands and 14 marsh-facultative species that use, but do not depend on wetlands. 
+
+`marsh_o` and `marsh_f`
+
+
+However, because some species were seldom encountered, they can be combined into ecologically meaningful guilds to improve sample sizes. The code to do this is also below.
+
+`bird_dat` and `so.full`
+
+The CWMP advisory team selected the species for the analysis (found at the bottom of the code chunk)
+
+```{r splist}
+
+#marsh_o<-c("PBGR", "SORA", "VIRA", "AMCO", "COGA", "AMBI", "LEBI", "BLTE", "FOTE", "WISN", "MAWR", "SEWR", "SWSP")
+
+#marsh_f<-c("ABDU", "AMWI", "BWTE", "WODU", "MALL", "SAND", "BCNH", "GRHE", "GREG", "GBHE", "CATE", "COTE", "COYE", "RWBL")
+
+#sp.full<-c("PBGR", "SORA", "VIRA", "AMCO", "COGA", "AMBI", "LEBI", "BLTE", "FOTE", "WISN", "MAWR", "SEWR", "SWSP", "ABDU", "AMWI", "BWTE", "WODU", "MALL", "SAND", "BCNH", "GRHE", "GREG", "GBHE", "CATE", "COTE", "COYE", "RWBL")
+
+#bird_dat<-bird_dat %>% mutate(ssp=ifelse(taxa_code %in% c("ABDU", "AMWI", "BWTE", "WODU", "MALL"), "dab", ifelse(taxa_code %in% c("SORA", "VIRA"), "rail", ifelse(taxa_code %in% c("AMCO", "COGA"), "coot", ifelse(taxa_code %in% c("AMBI", "LEBI"), "bit", ifelse(taxa_code %in% c("BCNH", "GRHE"), "smher", ifelse(taxa_code %in% c("GREG", "GBHE"), "lgher", ifelse(taxa_code %in% c("BLTE", "FOTE", "CATE", "COTE"), "tern", taxa_code))))))))
+
+#ssp.full<-c("dab", "rail", "coot", "bit", "smher", "lgher", "tern", "PBGR", "WISN", "MAWR", "SEWR", "SWSP", "SAND", "COYE", "RWBL")
+
+#Species list from Doug
+#sp.full<-c("PBGR", "SORA", "VIRA", "AMCO", "COGA", "AMBI", "LEBI", "BLTE", "FOTE", "WISN", "MAWR", "SWSP", "MUSW", "TRUS", "SACR", "SEWR", "YHBL")
+
+#Species list from CWMP advisory committee.
+sp.full<-c("PBGR", "SORA", "VIRA", "AMCO", "COGA", "AMBI", "LEBI", "BLTE", "FOTE", "WISN", "MAWR", "SWSP", "MUSW", "TRUS", "SACR", "SEWR", "YHBL", "COGR", "COYE", "RWBL")
+
+```
+
+#Species raw occupancy 
+
+Here we explore the raw occupancy based on basin-bcr. This is raw occupancy based on two visits per site. 
+
+```{r spsum}
+
+#create dataframes and tables outside loop
+
+master_basin<-events %>% select(region) %>% distinct() %>% na.omit()
+
+#Special events matrix to properly zero fill the occupancy frame. Notice this is nearly twice as long as the first events layer, which is expected. 
+events2<-NULL
+events2<-bird_dat %>% select(site_id, point_id, sample, year, region) %>% distinct()
+
+for(n in 1:length(sp.full)){
+  
+#n<-1 #for testing the loop
+  
+  sp.data<-NULL #clear old data frame
+  sp.data<-bird_dat %>% filter(taxa_code==sp.full[n])
+  sp<-unique(sp.data$taxa_code)
+  
+#Retain only needed data
+sp.data<-sp.data %>% select(individuals, site_id, point_id, sample, year, lat, lon, class, region, area_ha) %>% group_by(site_id, point_id, sample, year, class, region) %>% dplyr::summarise(count=sum(individuals)) %>% distinct()
+  
+#Merge with events layer to zero-fill
+  sp.data<-left_join(events2, sp.data, by=c("site_id", "point_id", "sample", "year", "region"))
+  
+#Zero fill the 'count' column
+  sp.data$count[is.na(sp.data$count)] <- 0 
+  sp.data$taxa_code<- sp.full[n]
+  
+#Let's summarize raw occupancy per region (this looks at each site-year combination to determine if it was occupied at least once). This dataframe may be most useful for establishing range. 
+  sp.occ<-NULL
+  sp.occ<-sp.data %>% group_by(year, site_id, region) %>% dplyr::summarize(sptot=sum(count)) %>%  mutate(occ=ifelse(sptot>=1, 1, 0))
+  sp.occ<-sp.occ %>% group_by(region) %>% dplyr::summarize(tot=length(occ), raw=sum(occ), per_occ=(raw/tot)*100) %>% select(-tot, -raw)
+
+colnames(sp.occ)[colnames(sp.occ) == "per_occ"] <- sp
+master_basin<-left_join(master_basin, sp.occ, by="region")
+
+}# end species loop
+
+write.csv(master_basin, "Output/OccupancyPerRegion_full.csv")
+
+```
+
+#Max count 
+
+Now that we have the list of species we can create summaries for each to see how many are reported and if we need to combine them similar to Hohman et al. (2021). This also creates the `CWMP_MaxCount.csv` used for the analysis, which is a zero-filled data matrix. 
+
+```{r range}
+
+#Create table outside the species loop
+maxcount<- as.data.frame(matrix(data = NA, nrow = 1, ncol = 16, byrow = FALSE, dimnames = NULL))
+names(maxcount) <- c("site_id", "point_id", "year", "lat", "long", "class", "basin", "region", "area_ha", "GLHDID", "pcntag", "pcntdev", "PerWetland", "lakelevel", "maxcount", "taxa_code")
+write.table(maxcount, file = paste(out.dir,"CWMP_MaxCount.csv", sep=""), row.names = FALSE, append = FALSE, quote = FALSE, sep = ",")
+
+##Old summary output table. To be deleted. 
+
+#sp.sum<- as.data.frame(matrix(data = NA, nrow = 1, ncol = 3, byrow #= FALSE, dimnames = NULL))
+#names(sp.sum) <- c("taxa_code", "per_occ", "mean")
+#write.table(sp.sum, file = paste(out.dir,"CWMP_OccupancyAbund.csv", sep=""), row.names = FALSE, append = FALSE, quote = FALSE, sep = ",")
+
+#Read back in the master_basin file to assing range  
+master_basin<-read.csv("Output/OccupancyPerRegion_full.csv")
+
+for(n in 1:length(sp.full)){
+  
+#n<-1 #for testing the loop
+  
+  sp.data<-NULL #clear old data frame
+  sp.data<-bird_dat %>% filter(taxa_code==sp.full[n])
+  sp<-unique(sp.data$taxa_code)
+  
+#Retain only needed data, and sum per point count visit
+sp.data<-sp.data %>% select(individuals, site_id, point_id, sample, year) %>% group_by(site_id, point_id, sample, year) %>% summarise(count=sum(individuals))
+
+#Following Hohman et al. 2021, the dependent variable was the maximum count in the two breeding-season point counts. Lets create this variable and write to a .csv 
+
+maxcount<-sp.data %>% group_by(site_id, point_id, year)  %>% filter(count==max(count)) %>% select(-sample) %>% distinct()
+
+#Merge with events layer to zero-fill
+maxcount<-left_join(events, maxcount, by=c("site_id", "point_id", "year"))
+
+#Zero fill the 'individuals' column
+  maxcount$count[is.na(maxcount$count)] <- 0 
+  maxcount$taxa_code<- sp.full[n]
+  
+#Create the range matrix using the per occ per basin > 10%
+
+sp.range<-master_basin %>% select(region, sp.full[n])
+colnames(sp.range)[colnames(sp.range) == sp.full[n]] <- "per_occ"
+
+sp.range<-sp.range %>% mutate(range=ifelse(per_occ>=5, 1, 0)) %>% select(-per_occ)
+
+#remove out of range observations and zeros
+sp.data<-left_join(maxcount, sp.range, by="region")
+
+#drop range == 0 
+sp.data<-sp.data %>% filter(range>=1) %>% select(-range)
+  
+write.table(sp.data, file = paste(out.dir,"CWMP_MaxCount.csv", sep=""), row.names = FALSE, append = TRUE, col.names=FALSE, quote = FALSE, sep = ",")  
+
+##Old summary outputs. To be deleted. 
+
+#Now we will calculate the mean max count alongside occupied stations to determine which species have enough data to be evaluated (according to Steidl et al. 2013)
+
+#sp.abund<-NULL
+#sp.abund<-as.data.frame(maxcount)
+#sp.abund<-sp.abund %>% filter(count>=1) %>% #dplyr::summarize(mean=mean(count))
+#sp.abund$taxa_code<-sp
+
+#sp.occ<-NULL
+#sp.occ<-sp.data %>% group_by(year, site_id) %>% dplyr::summarize(sptot=sum(count)) %>%  mutate(occ=ifelse(sptot>=1, 1, 0)) %>% select(-sptot) %>% ungroup()
+#sp.occ<-sp.occ %>% dplyr::summarize(tot=length(occ), raw=sum(occ), per_occ=(raw/tot)) %>% select(-tot, -raw)
+#sp.occ$taxa_code<-sp
+
+#sp.sum<-NULL
+#sp.sum<-left_join(sp.occ, sp.abund, by="taxa_code")
+#sp.sum<-sp.sum %>% select(taxa_code, per_occ, mean)
+
+#write.table(sp.sum, file = paste(out.dir,"CWMP_OccupancyAbund.csv", sep=""), row.names = FALSE, append = TRUE, col.names=FALSE, quote = FALSE, sep = ",")
+
+} #end loop
+
+```
+
